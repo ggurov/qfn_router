@@ -99,7 +99,7 @@ Prompts must live in RAM only:
 * keep `log_requests: false`; the engine logs token *counts*, never text.
 
 A canary prompt sent through the real path should not appear in `/var/log`, journald, or any state dir.
-`sytemd/30-no-swap.conf.example` is the drop-in form.
+`systemd/30-no-swap.conf.example` is the drop-in form.
 
 ## Measured (two boxes, same QFN IQ3_S weights, 2026-11-12)
 
