@@ -1,0 +1,6 @@
+# Keep the inference process out of swap: prompts and KV cache must stay in RAM.
+# Install as /etc/systemd/system/strata.service.d/30-no-swap.conf (and the same for strata-router.service),
+# then `systemctl daemon-reload`. Applies to new starts; to apply without a restart use
+# `systemctl set-property strata.service MemorySwapMax=0` (persists a drop-in itself).
+[Service]
+MemorySwapMax=0

@@ -1,0 +1,39 @@
+# nginx front door for the cache-affinity router.
+# Install as a site (or merge into the existing server block) and `nginx -t && systemctl reload nginx`.
+#
+# The map sends one client (by User-Agent) through the router and everything else straight to the local
+# engine, so a cutover needs no client change and rolls back with one line.
+
+map $http_user_agent $llm_upstream {
+    default        http://127.0.0.1:9931;      # direct to the local inference server
+    "~*hindsight"  http://127.0.0.1:8080;      # this client: through qfn_router
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    client_max_body_size 64m;
+    # Privacy: keep the whole allowed body in RAM (>= client_max_body_size) so nginx never spills a prompt
+    # to /var/lib/nginx/body, and do not write request lines at all.
+    client_body_buffer_size 64m;
+    access_log off;
+
+    # long prefills / long generations: do not cut the connection
+    proxy_read_timeout 7200s;
+    proxy_send_timeout 7200s;
+    proxy_connect_timeout 10s;
+
+    location / {
+        proxy_pass $llm_upstream;              # with a variable, nginx forwards the original URI
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;                   # SSE token stream must pass through unbuffered
+        proxy_cache off;
+        chunked_transfer_encoding on;
+    }
+}

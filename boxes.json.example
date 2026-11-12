@@ -1,0 +1,10 @@
+{
+ "listen": {"host": "127.0.0.1", "port": 8080},
+ "ttl_s": 900,
+ "default_answer_tokens": 512,
+ "log_requests": false,
+ "boxes": [
+  {"name": "fast", "base": "http://192.0.2.11:9931", "prefill": 3357, "decode": 131},
+  {"name": "slow", "base": "http://192.0.2.10:9931", "prefill": 1550, "decode": 78}
+ ]
+}

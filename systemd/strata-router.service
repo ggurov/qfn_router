@@ -1,0 +1,23 @@
+[Unit]
+Description=QFN cache-affinity router (prompt-cache aware load balancing for Strata boxes)
+Documentation=https://github.com/ggurov/qfn_router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Unprivileged, no home, no writes: the router holds its mapping and counters in memory only.
+DynamicUser=yes
+WorkingDirectory=/opt/qfn_router
+Environment=QFN_ROUTER_CONFIG=/etc/qfn_router/boxes.json
+ExecStart=/usr/bin/python3 /opt/qfn_router/router.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target

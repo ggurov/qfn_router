@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# the live config carries real hosts and measured constants; boxes.json.example is the template
+boxes.json
