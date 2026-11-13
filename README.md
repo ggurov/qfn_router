@@ -15,7 +15,12 @@ T_b = (1 - h_b) * P / prefill_b + A / decode_b + queue_b
 * `P` — prompt tokens (estimated from the body, refined per key from real usage),
 * `A` — expected output tokens (`max_tokens`, else a default),
 * `prefill_b`, `decode_b` — per-box constants measured on that hardware,
-* `queue_b` — in-flight work on the box, from its `/metrics` (`live.queued`, `live.prompt_tokens`),
+* `queue_b` — seconds of work already queued on the box: **this router's own in-flight requests** (counted
+  immediately at dispatch, each costing `A/decode_b`) plus the engine's reported queue
+  (`live.queued − our in-flight`, which covers other clients) and an in-progress prefill
+  (`live.prompt_tokens / prefill_b`). Counting our own in-flight requests is what makes a burst spread: a
+  polled `/metrics` is up to 2 s stale, so a metrics-only model sent an 8-request burst entirely to the fast
+  box; with the in-flight term the same burst split 5/3 and every request finished in ≤3.7 s (was ≤4.8 s).
 * `h_b` — 1 when the conversation key is mapped to box `b` and inside the park TTL, else 0.
 
 Affinity is a *discount*, not a pin: a busy box loses even its own conversations.

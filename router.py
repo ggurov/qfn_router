@@ -42,6 +42,7 @@ lock = threading.Lock()
 mapping: dict[str, dict] = {}      # key -> {"box": name, "expires": ts}
 stats: dict[str, dict] = {b["name"]: {"requests": 0, "hits": 0, "errors": 0} for b in BOXES}
 live: dict[str, dict] = {b["name"]: {"queued": 0, "prompt_tokens": 0, "state": "?", "ok": True} for b in BOXES}
+inflight: dict[str, int] = {b["name"]: 0 for b in BOXES}   # requests this router has running per box
 
 
 def poll_metrics() -> None:
@@ -84,13 +85,20 @@ def estimate_prompt_tokens(body: dict) -> int:
     return max(1, int(chars / 3.6) + 4 * len(body.get("messages") or []))
 
 
-def queue_cost(name: str, prefill: float) -> float:
+def queue_cost(box: dict, answer_tokens: float) -> float:
+    """Seconds of work already queued on the box: our own in-flight requests (immediate) plus whatever
+    the engine reports (covers other clients). Service time per request is the answer length over the
+    box's decode rate, so a faster box accrues queue cost more slowly and takes proportionally more load."""
+    name = box["name"]
     s = live.get(name) or {}
     if not s.get("ok", True):
         return 1e6
-    q = s.get("queued") or 0
+    with lock:
+        mine = inflight.get(name, 0)
+    external = max(0, (s.get("queued") or 0) - mine)
+    service = answer_tokens / max(box["decode"], 1.0)
     pt = (s.get("prompt_tokens") or 0) if s.get("state") in ("reading", "generating") else 0
-    return q * 20.0 + pt / max(prefill, 1.0)
+    return (mine + external) * service + pt / max(box["prefill"], 1.0)
 
 
 def choose(key: str, prompt_tokens: int, answer_tokens: float) -> tuple[str, dict]:
@@ -104,7 +112,7 @@ def choose(key: str, prompt_tokens: int, answer_tokens: float) -> tuple[str, dic
     scores = {}
     for b in BOXES:
         h = 1.0 if mapped_box == b["name"] else 0.0
-        s = (1.0 - h) * prompt_tokens / b["prefill"] + answer_tokens / b["decode"] + queue_cost(b["name"], b["prefill"])
+        s = (1.0 - h) * prompt_tokens / b["prefill"] + answer_tokens / b["decode"] + queue_cost(b, answer_tokens)
         scores[b["name"]] = round(s, 3)
     name = min(scores, key=scores.get)
     return name, scores
@@ -169,48 +177,54 @@ class Handler(BaseHTTPRequestHandler):
         req = urllib.request.Request(base_of(box) + self.path, data=body if method == "POST" else None,
                                      headers=headers, method=method)
         cached = None
+        with lock:
+            inflight[box] = inflight.get(box, 0) + 1
         try:
-            resp = urllib.request.urlopen(req, timeout=3600)
-        except urllib.error.HTTPError as e:
-            resp = e
-        except Exception:
-            with lock:
-                stats[box]["errors"] += 1
-            self.send_error(502, "upstream unreachable")
-            return
+            try:
+                resp = urllib.request.urlopen(req, timeout=3600)
+            except urllib.error.HTTPError as e:
+                resp = e
+            except Exception:
+                with lock:
+                    stats[box]["errors"] += 1
+                self.send_error(502, "upstream unreachable")
+                return
 
-        self.send_response(getattr(resp, "status", 200))
-        ctype = resp.headers.get("Content-Type", "application/json")
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        buf = b""
-        tail = b""
-        try:
-            while True:
-                chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                if cached is None:
-                    buf += chunk
-                    if b'"usage"' in buf or b"prompt_tokens_details" in buf:
-                        tail = buf[-4096:]
-                    if len(buf) > 65536:
-                        buf = buf[-8192:]
-        except Exception:
-            pass
+            self.send_response(getattr(resp, "status", 200))
+            ctype = resp.headers.get("Content-Type", "application/json")
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            buf = b""
+            tail = b""
+            try:
+                while True:
+                    chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    if cached is None:
+                        buf += chunk
+                        if b'"usage"' in buf or b"prompt_tokens_details" in buf:
+                            tail = buf[-4096:]
+                        if len(buf) > 65536:
+                            buf = buf[-8192:]
+            except Exception:
+                pass
+            finally:
+                blob = (tail or buf)[-4096:]
+                for piece in blob.split(b"data: "):
+                    try:
+                        o = json.loads(piece.strip())
+                    except Exception:
+                        continue
+                    c = (((o.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens"))
+                    if c is not None:
+                        cached = int(c)
         finally:
-            blob = (tail or buf)[-4096:]
-            for piece in blob.split(b"data: "):
-                try:
-                    o = json.loads(piece.strip())
-                except Exception:
-                    continue
-                c = (((o.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens"))
-                if c is not None:
-                    cached = int(c)
+            with lock:
+                inflight[box] = max(0, inflight.get(box, 0) - 1)
         if key != "-":
             note_result(key, box, cached)
         if LOG_REQUESTS:      # off by default: no per-request records outside ephemeral memory
