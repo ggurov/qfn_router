@@ -133,6 +133,11 @@ router decision           key=… box=fast P=34 A=32 cached=30 scores={fast 0.23
                           (slow was 8 requests deep: the queue term, not the cache term, decided)
 ```
 
+```
+burst of 8 concurrent, metrics-only queue   8 -> fast, 0 -> slow   walls 0.86 … 4.76 s
+burst of 8 concurrent, with in-flight term  5 -> fast, 3 -> slow   walls 0.50 … 3.69 s
+```
+
 ## Files
 
 ```
