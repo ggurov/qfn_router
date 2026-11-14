@@ -1,24 +1,24 @@
-# nginx front door for the cache-affinity router.
-# Install as a site (or merge into the existing server block) and `nginx -t && systemctl reload nginx`.
-#
-# The map sends one client (by User-Agent) through the router and everything else straight to the local
-# engine, so a cutover needs no client change and rolls back with one line.
-
-map $http_user_agent $llm_upstream {
-    default        http://127.0.0.1:9931;      # direct to the local inference server
-    "~*hindsight"  http://127.0.0.1:8080;      # this client: through qfn_router
+# Every client on this front door goes through the cache-affinity router (qfn_router), which spreads work
+# between this box and qwen.nj02.gurov.us and keeps a conversation on the box that has it parked.
+# The local engine on :9931 is only reached if the router is down (proxy_next_upstream below).
+upstream qfn_router {
+    server 127.0.0.1:8080 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:9931 backup;      # router unavailable: answer locally, no balancing
 }
+
 
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
-    server_name _;
+    server_name _;   # this front door's own names
 
     client_max_body_size 64m;
-    # Privacy: keep the whole allowed body in RAM (>= client_max_body_size) so nginx never spills a prompt
-    # to /var/lib/nginx/body, and do not write request lines at all.
-    client_body_buffer_size 64m;
+
+    # No access log: request lines and any URI metadata must not persist on disk.
     access_log off;
+    # Keep the whole allowed request body in RAM (== client_max_body_size), so nginx never spills a prompt
+    # to /var/lib/nginx/body. Bodies are forwarded and then dropped; nothing is written to disk.
+    client_body_buffer_size 64m;
 
     # long prefills / long generations: do not cut the connection
     proxy_read_timeout 7200s;
@@ -26,13 +26,16 @@ server {
     proxy_connect_timeout 10s;
 
     location / {
-        proxy_pass $llm_upstream;              # with a variable, nginx forwards the original URI
+        proxy_pass http://qfn_router;
+        proxy_next_upstream error timeout http_502 http_503;
+        proxy_next_upstream_tries 2;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering off;                   # SSE token stream must pass through unbuffered
+        # SSE token stream must pass through unbuffered
+        proxy_buffering off;
         proxy_cache off;
         chunked_transfer_encoding on;
     }

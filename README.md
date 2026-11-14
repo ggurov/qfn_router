@@ -74,23 +74,30 @@ curl -s http://127.0.0.1:8080/router/stats
 
 The unit runs as an unprivileged user, listens on loopback only. Put nginx (or any TLS terminator) in front.
 
-### Cutover by user agent (one client, no client change)
+### Put the router in front of every client
 
 ```nginx
-map $http_user_agent $llm_upstream {
-    default        http://127.0.0.1:9931;      # everything else: direct
-    "~*hindsight"  http://127.0.0.1:8080;      # this client: through the router
+upstream qfn_router {
+    server 127.0.0.1:8080 max_fails=3 fail_timeout=10s;
+    server 127.0.0.1:9931 backup;      # router down: answer locally, no balancing
 }
 
 location / {
-    proxy_pass $llm_upstream;                  # variables: nginx passes the original URI
+    proxy_pass http://qfn_router;
+    proxy_next_upstream error timeout http_502 http_503;
+    proxy_next_upstream_tries 2;
     proxy_http_version 1.1;
     proxy_buffering off;                       # SSE must not be buffered
     proxy_read_timeout 7200s;
 }
 ```
 
-Rollback is the upstream line alone; the router can stay running unused.
+No client header is inspected, so a client cannot silently fall through to one box by changing its HTTP
+library. Control requests (`/health`, `/v1/models`, the UI) go to `default_box` — a control call to a remote
+box for a path it does not serve would 404, and `/metrics` must stay local for the poller.
+
+An earlier revision selected clients with `map $http_user_agent` (`"~*hindsight" -> 8080`). That works for one
+known client and is the wrong default: it balances by accident of a UA string. Use the upstream form.
 
 ### Privacy posture (recommended, and what this was deployed with)
 
