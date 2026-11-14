@@ -35,6 +35,7 @@ CFG = json.loads(CFG_PATH.read_text())
 BOXES = CFG["boxes"]
 TTL = float(CFG.get("ttl_s", 900))
 DEFAULT_A = float(CFG.get("default_answer_tokens", 512))
+DEFAULT_BOX = CFG.get("default_box") or BOXES[0]["name"]   # non-chat requests (/health, /v1/models, UI)
 LOG_REQUESTS = bool(CFG.get("log_requests", False))   # per-request lines off unless a JSON config opts in
 PASS_HEADERS = {"content-type", "authorization", "accept", "user-agent", "x-api-key"}
 
@@ -72,7 +73,8 @@ def conversation_key(body: dict, headers) -> str:
             head = str(m.get("content") or "")
             break
     first_user = next((str(m.get("content") or "") for m in msgs if m.get("role") == "user"), "")
-    tenant = headers.get("authorization") or headers.get("x-api-key") or ""
+    model = str(body.get("model") or "")
+    tenant = str(headers.get("authorization") or headers.get("x-api-key") or "") + "|" + model
     h = hashlib.sha256()
     h.update(head.encode("utf-8", "replace")); h.update(b"\x00")
     h.update(first_user.encode("utf-8", "replace")); h.update(b"\x00")
@@ -84,6 +86,10 @@ def estimate_prompt_tokens(body: dict) -> int:
     chars = sum(len(str(m.get("content") or "")) for m in (body.get("messages") or []))
     return max(1, int(chars / 3.6) + 4 * len(body.get("messages") or []))
 
+
+def order(scores: dict) -> list[str]:
+    """Best box first, then the others as fallbacks (a dead or erroring box must not fail the request)."""
+    return sorted(scores, key=scores.get)
 
 def queue_cost(box: dict, answer_tokens: float) -> float:
     """Seconds of work already queued on the box: our own in-flight requests (immediate) plus whatever
@@ -170,26 +176,53 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
         prompt_tokens = estimate_prompt_tokens(payload) if payload else 0
         answer_tokens = float(payload.get("max_tokens") or DEFAULT_A)
-        key = conversation_key(payload, self.headers) if payload.get("messages") else "-"
-        box, scores = choose(key, prompt_tokens, answer_tokens) if key != "-" else (BOXES[0]["name"], {})
+        if payload.get("messages"):
+            key = conversation_key(payload, self.headers)
+            box, scores = choose(key, prompt_tokens, answer_tokens)
+            plan = order(scores)
+        else:
+            # no conversation (health, models, UI, metrics): a control request, not a chat turn
+            key, scores = "-", {}
+            box, plan = DEFAULT_BOX, [DEFAULT_BOX]
 
         headers = {k: v for k, v in self.headers.items() if k.lower() in PASS_HEADERS}
-        req = urllib.request.Request(base_of(box) + self.path, data=body if method == "POST" else None,
-                                     headers=headers, method=method)
         cached = None
+        resp = None
+        tried = []
+        for candidate in plan:
+            req = urllib.request.Request(base_of(candidate) + self.path, data=body if method == "POST" else None,
+                                         headers=headers, method=method)
+            with lock:
+                inflight[candidate] = inflight.get(candidate, 0) + 1
+            try:
+                try:
+                    resp = urllib.request.urlopen(req, timeout=3600)
+                except urllib.error.HTTPError as e:
+                    resp = e
+                except Exception:
+                    with lock:
+                        stats[candidate]["errors"] += 1
+                    tried.append(candidate)
+                    resp = None
+                    continue
+                if resp.status >= 500 and len(plan) > 1:
+                    with lock:
+                        stats[candidate]["errors"] += 1
+                    tried.append(candidate)
+                    resp = None
+                    continue
+                box = candidate
+                break
+            finally:
+                with lock:
+                    inflight[candidate] = max(0, inflight.get(candidate, 0) - 1)
+        if resp is None:
+            self.send_error(502, "no upstream reachable: " + ", ".join(tried))
+            return
+
         with lock:
             inflight[box] = inflight.get(box, 0) + 1
         try:
-            try:
-                resp = urllib.request.urlopen(req, timeout=3600)
-            except urllib.error.HTTPError as e:
-                resp = e
-            except Exception:
-                with lock:
-                    stats[box]["errors"] += 1
-                self.send_error(502, "upstream unreachable")
-                return
-
             self.send_response(getattr(resp, "status", 200))
             ctype = resp.headers.get("Content-Type", "application/json")
             self.send_header("Content-Type", ctype)
@@ -229,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
             note_result(key, box, cached)
         if LOG_REQUESTS:      # off by default: no per-request records outside ephemeral memory
             print(f"{time.strftime('%H:%M:%S')} key={key[:8]} box={box} P={prompt_tokens} A={int(answer_tokens)} "
-                  f"cached={cached} scores={scores}", flush=True)
+                  f"cached={cached} scores={scores} tried={tried}", flush=True)
 
 
 def main():
